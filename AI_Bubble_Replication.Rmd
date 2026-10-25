@@ -1,0 +1,597 @@
+---
+title: "Explosive Prices in the Korean AI Rally: replication code"
+subtitle: "ECOM90011 Financial Econometrics Research Project"
+author: "Sukanya Biswabandini"
+output:
+  html_document:
+    toc: true
+    number_sections: true
+    df_print: kable
+---
+
+```{r knitr-setup, include = FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.width = 9, fig.height = 4.5)
+```
+
+# Setup
+
+```{r packages}
+pkgs <- c("quantmod", "xts", "zoo", "exuber", "rugarch", "dplyr", "tibble", "readr")
+missing <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(missing) > 0) install.packages(missing)
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+for (d in c("data/raw", "data/clean", "output/figures", "output/tables"))
+  if (!dir.exists(d)) dir.create(d, recursive = TRUE)
+```
+
+```{r parameters}
+set.seed(90011)
+
+ai_start     <- as.Date("2021-01-01")
+ai_end       <- as.Date("2026-10-09")
+dotcom_start <- as.Date("1990-01-01")
+dotcom_end   <- as.Date("2002-12-31")
+
+# Yahoo Finance series: Nasdaq and Dow for the dot-com comparison,
+# Korean series for the source cross-check and the start-date check.
+series <- tibble::tribble(
+  ~name,       ~ticker,     ~era,      ~role,
+  "Samsung",   "005930.KS", "AI",      "exposed",
+  "SK Hynix",  "000660.KS", "AI",      "exposed",
+  "KOSPI",     "^KS11",     "AI",      "exposed",
+  "Nasdaq",    "^IXIC",     "Dot-com", "exposed",
+  "Dow Jones", "^DJI",      "Dot-com", "control"
+)
+
+adf_lag    <- 0
+mc_reps    <- 2000
+wb_reps    <- 500
+min_window <- function(T) floor((0.01 + 1.8 / sqrt(T)) * T)
+min_dur    <- function(n) round(log(n))
+file_tag   <- function(x) gsub("[^A-Za-z0-9]+", "_", x)
+```
+
+# Data
+
+## Yahoo Finance
+
+Raw files in `data/raw/` are frozen copies. A file is downloaded only if it is missing.
+
+```{r yahoo-data}
+download_one <- function(ticker, from, to) {
+  x <- quantmod::getSymbols(ticker, src = "yahoo", from = from, to = to + 1,
+                            auto.assign = FALSE)
+  x <- x[paste0(from, "/", to)]
+  data.frame(date = zoo::index(x), close = as.numeric(quantmod::Cl(x)))
+}
+
+load_yahoo <- function(name, ticker, from, to, path) {
+  if (!file.exists(path)) readr::write_csv(download_one(ticker, from, to), path)
+  x <- as.data.frame(readr::read_csv(path, show_col_types = FALSE))
+  x$date <- as.Date(x$date)
+  x <- x[!is.na(x$close), c("date", "close")]
+  x <- x[order(x$date), ]
+  x$log_price <- log(x$close)
+  x$log_ret   <- c(NA, diff(x$log_price))
+  x
+}
+
+clean <- list()
+for (i in seq_len(nrow(series))) {
+  s   <- series[i, ]
+  win <- if (s$era == "AI") c(ai_start, ai_end) else c(dotcom_start, dotcom_end)
+  clean[[s$name]] <- load_yahoo(s$name, s$ticker, win[1], win[2],
+                                file.path("data/raw", paste0(file_tag(s$name), ".csv")))
+}
+
+stopifnot(all(vapply(clean, function(d) all(diff(d$date) > 0), logical(1))),
+          all(vapply(clean, function(d) all(d$close > 0), logical(1))))
+data.frame(name = names(clean), n = sapply(clean, nrow),
+           first = as.Date(sapply(clean, function(d) min(d$date))),
+           last  = as.Date(sapply(clean, function(d) max(d$date))), row.names = NULL)
+```
+
+## Korea Exchange (main data for Korea)
+
+```{r krx-data}
+krx_stems  <- c(KOSPI = "krx_KOSPI", Samsung = "krx_Samsung",
+                `SK Hynix` = "krx_SK_Hynix", `KRX Banks` = "krx_Banks")
+krx_chunks <- c("2021_2022", "2023_2024", "2025_2026")
+
+read_krx <- function(stem) {
+  parts <- lapply(krx_chunks, function(ch) {
+    f <- file.path("data/raw", paste0(stem, "_", ch, ".csv"))
+    stopifnot(file.exists(f))
+    read.csv(f, fileEncoding = "UTF-8-BOM", check.names = FALSE, na.strings = c("", "-"))
+  })
+  d <- do.call(rbind, parts)
+  d$date <- as.Date(d$Date, format = "%Y/%m/%d")
+  stopifnot(!anyNA(d$date), !anyDuplicated(d$date))
+  d <- d[order(d$date), ]
+  out <- data.frame(date = d$date, close = as.numeric(d$Close),
+                    dy = as.numeric(d[["Dividend yield"]]))
+  if ("Dividend per share" %in% names(d)) out$dps <- as.numeric(d[["Dividend per share"]])
+  out
+}
+krx <- lapply(krx_stems, read_krx)
+
+for (nm in names(krx)) {
+  d <- krx[[nm]]
+  stopifnot(min(d$date) == as.Date("2021-01-04"), max(d$date) == as.Date("2026-10-08"),
+            nrow(d) == 1412, all(d$close > 0), all(d$dy > 0), !anyNA(d$close), !anyNA(d$dy))
+  if (!is.null(d$dps)) stopifnot(all(d$dps > 0), max(abs(100 * d$dps / d$close - d$dy)) <= 0.006)
+}
+
+# Dividend per share steps (Appendix A)
+for (nm in c("Samsung", "SK Hynix")) {
+  d <- krx[[nm]]
+  cat("\n", nm, "dividend per share changes:\n")
+  print(d[c(TRUE, diff(d$dps) != 0), c("date", "dps")], row.names = FALSE)
+}
+
+# Yahoo against KRX closes (Appendix A)
+for (nm in c("KOSPI", "Samsung", "SK Hynix")) {
+  m <- merge(krx[[nm]][, c("date", "close")], clean[[nm]][, c("date", "close")],
+             by = "date", suffixes = c("_krx", "_yahoo"))
+  cat(nm, ": ", nrow(m), " shared days, ",
+      sum(abs(m$close_krx / m$close_yahoo - 1) > 0.001), " differ by more than 0.1%, ",
+      length(setdiff(krx[[nm]]$date, clean[[nm]]$date)), " KRX days missing in Yahoo\n", sep = "")
+}
+
+# Log price, and log price-dividend ratio: log P - log DPS for stocks, -log(DY/100) for indices
+krx_price <- lapply(krx, function(d) data.frame(date = d$date, log_price = log(d$close)))
+krx_ratio <- list(
+  KOSPI       = data.frame(date = krx$KOSPI$date, log_price = -log(krx$KOSPI$dy / 100)),
+  Samsung     = data.frame(date = krx$Samsung$date,
+                           log_price = log(krx$Samsung$close) - log(krx$Samsung$dps)),
+  `SK Hynix`  = data.frame(date = krx$`SK Hynix`$date,
+                           log_price = log(krx$`SK Hynix`$close) - log(krx$`SK Hynix`$dps)),
+  `KRX Banks` = data.frame(date = krx$`KRX Banks`$date, log_price = -log(krx$`KRX Banks`$dy / 100)))
+```
+
+# Test functions
+
+```{r functions}
+# Monte Carlo critical values, cached in data/clean/
+get_cv <- function(n, minw, nrep = mc_reps) {
+  f <- file.path("data/clean", sprintf("mc_cv_n%d_minw%d_rep%d.rds", n, minw, nrep))
+  if (file.exists(f)) return(readRDS(f))
+  cv <- exuber::radf_mc_cv(n = n, minw = minw, nrep = nrep, seed = 90011)
+  saveRDS(cv, f)
+  cv
+}
+
+# Wild bootstrap critical values, cached in data/clean/
+get_wb_cv <- function(y, prefix, tag, nboot = wb_reps) {
+  mw <- min_window(length(y))
+  f  <- file.path("data/clean", sprintf("%s_%s_minw%d_boot%d.rds", prefix, tag, mw, nboot))
+  if (file.exists(f)) return(readRDS(f))
+  cv <- exuber::radf_wb_cv(y, minw = mw, nboot = nboot, seed = 90011)
+  saveRDS(cv, f)
+  cv
+}
+
+pick95 <- function(x) {
+  if (is.null(dim(x)))     return(as.numeric(x[grep("95", names(x))]))
+  if (length(dim(x)) == 2) return(as.numeric(x[, grep("95", colnames(x))]))
+  as.numeric(x[, grep("95", dimnames(x)[[2]]), 1])
+}
+
+# GSADF and BSADF with episode dating
+run_psy <- function(d, lag = adf_lag) {
+  y  <- d$log_price
+  n  <- length(y)
+  mw <- min_window(n)
+  r  <- exuber::radf(y, minw = mw, lag = lag)
+  cv <- get_cv(n, mw)
+
+  bsadf     <- as.numeric(r$bsadf)
+  cv95_path <- as.numeric(cv$bsadf_cv[, grep("95", colnames(cv$bsadf_cv))])
+  stopifnot(length(bsadf) == length(cv95_path))
+  dates <- tail(d$date, length(bsadf))
+  above <- bsadf > cv95_path
+
+  runs   <- rle(above)
+  ends   <- cumsum(runs$lengths)
+  starts <- ends - runs$lengths + 1
+  k      <- runs$values
+  last   <- length(dates)
+  episodes <- data.frame(
+    origination = dates[starts[k]],
+    last_above  = dates[ends[k]],
+    termination = ifelse(ends[k] < last, as.character(dates[pmin(ends[k] + 1, last)]),
+                         "ongoing at sample end"),
+    days_above  = runs$lengths[k])
+
+  list(n = n, minw = mw, gsadf = as.numeric(r$gsadf),
+       gsadf_cv95 = unname(cv$gsadf_cv["95%"]),
+       bsadf = data.frame(date = dates, bsadf = bsadf, cv95 = cv95_path, above = above),
+       episodes = episodes)
+}
+
+# Episodes kept: GSADF must reject, and an episode must last at least round(log T) days
+kept_list <- function(p) {
+  if (p$gsadf <= p$gsadf_cv95) return(p$episodes[0, ])
+  p$episodes[p$episodes$days_above >= min_dur(p$n), , drop = FALSE]
+}
+
+kept_eps <- function(dates, bsadf, cv, n) {
+  r <- rle(bsadf > cv); ends <- cumsum(r$lengths); starts <- ends - r$lengths + 1
+  k <- r$values & r$lengths >= min_dur(n)
+  data.frame(origination = dates[starts[k]], last_above = dates[ends[k]],
+             days_above = r$lengths[k])
+}
+
+summarise_psy <- function(p, nm, layer) {
+  keep <- kept_list(p)
+  rec  <- keep[keep$origination >= as.Date("2025-01-01"), , drop = FALSE]
+  data.frame(name = nm, layer = layer, n = p$n,
+             gsadf = round(p$gsadf, 3), cv95 = round(p$gsadf_cv95, 3),
+             reject = p$gsadf > p$gsadf_cv95,
+             episodes_kept = nrow(keep),
+             longest_kept  = if (nrow(keep)) max(keep$days_above) else 0,
+             kept_2025_26  = nrow(rec),
+             first_2025_26 = if (nrow(rec)) as.character(min(rec$origination)) else NA)
+}
+```
+
+# Size and power of the test (Appendix B)
+
+Takes about 10 to 20 minutes.
+
+```{r size-power}
+n_sim    <- 1410
+mw_sim   <- min_window(n_sim)
+n_rep_v2 <- 200
+cv95     <- unname(get_cv(n_sim, mw_sim)$gsadf_cv["95%"])
+
+set.seed(90013)
+gsadf_rw <- replicate(n_rep_v2, as.numeric(
+  exuber::radf(cumsum(rnorm(n_sim)), minw = mw_sim, lag = adf_lag)$gsadf))
+
+gsadf_bubble <- sapply(seq_len(n_rep_v2), function(i) as.numeric(
+  exuber::radf(exuber::sim_psy1(n = n_sim, seed = 1000 + i), minw = mw_sim, lag = adf_lag)$gsadf))
+
+v2_table <- data.frame(
+  design         = c("random walk (size)", "planted bubble (power)"),
+  simulations    = n_rep_v2,
+  cv95           = cv95,
+  rejection_rate = c(mean(gsadf_rw > cv95), mean(gsadf_bubble > cv95)))
+v2_table
+readr::write_csv(v2_table, "output/tables/v2_size_power.csv")
+```
+
+# Yahoo series: GSADF and BSADF
+
+```{r yahoo-gsadf}
+psy <- lapply(clean, run_psy)
+
+stage1_table <- do.call(rbind, lapply(names(psy), function(nm) {
+  p <- psy[[nm]]; keep <- kept_list(p)
+  data.frame(name = nm, era = series$era[series$name == nm], n = p$n, minw = p$minw,
+             gsadf = round(p$gsadf, 3), cv95 = round(p$gsadf_cv95, 3),
+             reject_5pct = p$gsadf > p$gsadf_cv95, min_days = min_dur(p$n),
+             episodes_kept = nrow(keep),
+             longest_kept = if (nrow(keep)) max(keep$days_above) else 0)
+}))
+stage1_table
+readr::write_csv(stage1_table, "output/tables/stage1_gsadf_yahoo.csv")
+```
+
+# H1: Korean series, log price and log price-dividend ratio (Section 4.1)
+
+```{r h1}
+psy_krx_price <- lapply(krx_price, run_psy)
+psy_krx_ratio <- lapply(krx_ratio, run_psy)
+main <- list(price = psy_krx_price, ratio = psy_krx_ratio)
+
+h1_table <- do.call(rbind, lapply(names(main), function(layer)
+  do.call(rbind, lapply(names(main[[layer]]), function(nm)
+    summarise_psy(main[[layer]][[nm]], nm, layer)))))
+h1_table <- h1_table[order(h1_table$name, h1_table$layer), ]; rownames(h1_table) <- NULL
+readr::write_csv(h1_table, "output/tables/h1_main_gsadf.csv")
+
+h1_episodes <- do.call(rbind, lapply(names(main), function(layer)
+  do.call(rbind, lapply(names(main[[layer]]), function(nm) {
+    ep <- kept_list(main[[layer]][[nm]])
+    if (nrow(ep)) cbind(name = nm, layer = layer, ep) }))))
+rownames(h1_episodes) <- NULL
+readr::write_csv(h1_episodes, "output/tables/h1_main_episodes.csv")
+
+# Source check: GSADF on Yahoo and KRX prices
+yk <- c("KOSPI", "Samsung", "SK Hynix")
+data.frame(name = yk,
+           gsadf_yahoo = round(sapply(psy[yk], `[[`, "gsadf"), 3),
+           cv95_yahoo  = round(sapply(psy[yk], `[[`, "gsadf_cv95"), 3),
+           gsadf_krx   = round(sapply(psy_krx_price[yk], `[[`, "gsadf"), 3),
+           cv95_krx    = round(sapply(psy_krx_price[yk], `[[`, "gsadf_cv95"), 3), row.names = NULL)
+
+# Figure 1
+for (nm in names(psy_krx_price)) {
+  png(sprintf("output/figures/h1_main_%s.png", file_tag(nm)), width = 2000, height = 1400, res = 200)
+  par(mfrow = c(2, 1), mar = c(3, 4, 3, 1))
+  for (layer in c("price", "ratio")) {
+    p <- main[[layer]][[nm]]; b <- p$bsadf; ep <- kept_list(p)
+    plot(b$date, b$bsadf, type = "n", ylim = range(b$bsadf, b$cv95), xlab = "", ylab = "BSADF",
+         main = sprintf("%s, log %s: GSADF %.2f (95%% cv %.2f)", nm,
+                        if (layer == "price") "price" else "price-dividend ratio",
+                        p$gsadf, p$gsadf_cv95))
+    if (nrow(ep)) rect(ep$origination, par("usr")[3], ep$last_above, par("usr")[4],
+                       col = "grey85", border = NA)
+    lines(b$date, b$bsadf); lines(b$date, b$cv95, col = "red", lty = 2)
+  }
+  dev.off()
+}
+
+h1_table
+h1_episodes
+```
+
+# Robustness (Section 4.2 and Appendix C)
+
+## Wild bootstrap critical values, Korean series
+
+Cached results load instantly. Without the cache this takes several hours.
+
+```{r wb-krx}
+wb_row <- function(nm, layer, d, p) {
+  cv   <- get_wb_cv(d$log_price, "wb_krx", paste0(file_tag(nm), "_", layer))
+  gs95 <- pick95(cv$gsadf_cv); bs95 <- pick95(cv$bsadf_cv)
+  stopifnot(length(gs95) == 1, length(bs95) == nrow(p$bsadf))
+  ep <- kept_eps(p$bsadf$date, p$bsadf$bsadf, bs95, p$n)
+  if (p$gsadf <= gs95) ep <- ep[0, ]
+  data.frame(name = nm, layer = layer, gsadf = round(p$gsadf, 3),
+             cv95_mc = round(p$gsadf_cv95, 3), cv95_wb = round(gs95, 3),
+             reject_mc = p$gsadf > p$gsadf_cv95, reject_wb = p$gsadf > gs95,
+             episodes_wb = nrow(ep), longest_wb = if (nrow(ep)) max(ep$days_above) else 0,
+             first_wb = if (nrow(ep)) as.character(min(ep$origination)) else NA)
+}
+
+wb_krx <- rbind(
+  do.call(rbind, lapply(names(krx_price), function(nm)
+    wb_row(nm, "price", krx_price[[nm]], psy_krx_price[[nm]]))),
+  do.call(rbind, lapply(names(krx_ratio), function(nm)
+    wb_row(nm, "ratio", krx_ratio[[nm]], psy_krx_ratio[[nm]]))))
+wb_krx
+readr::write_csv(wb_krx, "output/tables/robust_wild_bootstrap_krx.csv")
+```
+
+## Episode dates under wild bootstrap critical values
+
+```{r wb-dating}
+wb_dates <- function(nm, layer, d, p) {
+  cv   <- get_wb_cv(d$log_price, "wb_krx", paste0(file_tag(nm), "_", layer))
+  gs95 <- pick95(cv$gsadf_cv); bs95 <- pick95(cv$bsadf_cv)
+  ep <- kept_eps(p$bsadf$date, p$bsadf$bsadf, bs95, p$n)
+  if (nrow(ep) == 0) return(NULL)
+  ep$termination <- p$bsadf$date[pmin(match(ep$last_above, p$bsadf$date) + 1, nrow(p$bsadf))]
+  cbind(name = nm, layer = layer, gsadf_rejects_wb = p$gsadf > gs95, ep)
+}
+
+wb_episodes <- rbind(
+  do.call(rbind, lapply(names(krx_price), function(nm)
+    wb_dates(nm, "price", krx_price[[nm]], psy_krx_price[[nm]]))),
+  do.call(rbind, lapply(names(krx_ratio), function(nm)
+    wb_dates(nm, "ratio", krx_ratio[[nm]], psy_krx_ratio[[nm]]))))
+rownames(wb_episodes) <- NULL
+wb_episodes
+readr::write_csv(wb_episodes, "output/tables/robust_wb_episodes_krx.csv")
+```
+
+## Wild bootstrap critical values, Nasdaq and Dow
+
+```{r wb-dotcom}
+wb_dotcom <- do.call(rbind, lapply(c("Nasdaq", "Dow Jones"), function(nm) {
+  p  <- psy[[nm]]
+  cv <- get_wb_cv(clean[[nm]]$log_price, "wb_cv", file_tag(nm))
+  gs95 <- pick95(cv$gsadf_cv)
+  data.frame(name = nm, gsadf = round(p$gsadf, 3),
+             cv95_mc = round(p$gsadf_cv95, 3), cv95_wb = round(gs95, 3),
+             reject_mc = p$gsadf > p$gsadf_cv95, reject_wb = p$gsadf > gs95)
+}))
+wb_dotcom
+readr::write_csv(wb_dotcom, "output/tables/robust_wild_bootstrap_dotcom.csv")
+```
+
+## Alternative start dates (Yahoo prices)
+
+```{r start-dates}
+alt_starts <- as.Date(c("2019-01-01", "2021-01-01", "2023-01-01"))
+ai_series  <- series[series$era == "AI", ]
+
+get_alt <- function(nm, ticker, start) {
+  if (start >= ai_start) { d <- clean[[nm]]; return(d[d$date >= start, ]) }
+  load_yahoo(nm, ticker, start, ai_end,
+             file.path("data/raw", paste0(file_tag(nm), "_from", format(start, "%Y"), ".csv")))
+}
+
+alt_table <- do.call(rbind, lapply(seq_len(nrow(ai_series)), function(i) {
+  nm <- ai_series$name[i]
+  do.call(rbind, lapply(seq_along(alt_starts), function(j) {
+    s    <- alt_starts[j]
+    p    <- if (s == ai_start) psy[[nm]] else run_psy(get_alt(nm, ai_series$ticker[i], s))
+    ep   <- kept_list(p)
+    ep25 <- ep[ep$origination >= as.Date("2025-01-01"), ]
+    data.frame(name = nm, start = s, n = p$n,
+               gsadf = round(p$gsadf, 3), cv95 = round(p$gsadf_cv95, 3),
+               reject = p$gsadf > p$gsadf_cv95,
+               episodes_all = nrow(ep), episodes_2025on = nrow(ep25),
+               first_2025on   = if (nrow(ep25)) min(ep25$origination) else as.Date(NA),
+               longest_2025on = if (nrow(ep25)) max(ep25$days_above) else 0)
+  }))
+}))
+alt_table
+readr::write_csv(alt_table, "output/tables/robust_start_dates.csv")
+```
+
+# H2: comparison with the dot-com episode (Section 5)
+
+```{r h2}
+psy_h2   <- c(psy_krx_price, psy[c("Nasdaq", "Dow Jones")])
+clean_h2 <- c(lapply(krx, function(d) data.frame(date = d$date, close = d$close,
+                                                  log_price = log(d$close),
+                                                  log_ret = c(NA, diff(log(d$close))))),
+              clean[c("Nasdaq", "Dow Jones")])
+era_h2   <- c(KOSPI = "AI", Samsung = "AI", `SK Hynix` = "AI", `KRX Banks` = "AI",
+              Nasdaq = "Dot-com", `Dow Jones` = "Dot-com")
+
+ep_metrics <- function(nm) {
+  p <- psy_h2[[nm]]; d <- clean_h2[[nm]]; b <- p$bsadf
+  ep <- kept_list(p)
+  if (nrow(ep) == 0) return(NULL)
+  do.call(rbind, lapply(seq_len(nrow(ep)), function(i) {
+    o <- ep$origination[i]; e <- ep$last_above[i]
+    in_ep    <- d$date >= o & d$date <= e
+    i_peak   <- which(in_ep)[which.max(d$log_price[in_ep])]
+    in_b     <- b$date >= o & b$date <= e
+    after    <- head(which(d$date > e), 250)
+    trough   <- if (length(after)) min(d$log_price[after]) else NA
+    post_pk  <- head(which(d$date > d$date[i_peak]), 60)
+    trough60 <- if (length(post_pk)) min(d$log_price[post_pk]) else NA
+    data.frame(
+      name = nm, era = era_h2[[nm]], origination = o, last_above = e,
+      days_above       = ep$days_above[i],
+      peak_date        = d$date[i_peak],
+      peak_margin      = round(max(b$bsadf[in_b] - b$cv95[in_b]), 2),
+      runup_pct        = round(100 * (exp(d$log_price[i_peak] - d$log_price[which(in_ep)[1]]) - 1), 1),
+      peak_to_end_days = sum(in_ep & d$date > d$date[i_peak]),
+      drawdown_pct     = round(100 * (exp(trough - d$log_price[i_peak]) - 1), 1),
+      days_after       = length(after),
+      dd60_pct         = round(100 * (exp(trough60 - d$log_price[i_peak]) - 1), 1),
+      dd60_days        = length(post_pk))
+  }))
+}
+
+h2_krx <- do.call(rbind, lapply(names(psy_h2), ep_metrics)); rownames(h2_krx) <- NULL
+readr::write_csv(h2_krx, "output/tables/h2_episode_metrics_krx.csv")
+
+# KOSPI's longest episode against the Nasdaq 1999-2000 episode
+h2_head <- rbind(
+  { x <- h2_krx[h2_krx$name == "KOSPI", ]; x[which.max(x$days_above), ] },
+  { x <- h2_krx[h2_krx$name == "Nasdaq" & h2_krx$origination >= as.Date("1995-01-01"), ]
+    x[which.max(x$days_above), ] })
+h2_head
+readr::write_csv(h2_head, "output/tables/h2_headline_krx.csv")
+
+# Figure 2: event-time overlay
+overlay_names <- c("KOSPI", "Samsung", "SK Hynix", "Nasdaq")
+overlay_cols  <- c("black", "blue", "darkgreen", "red")
+window        <- c(-500, 250)
+paths <- lapply(overlay_names, function(nm) {
+  x <- h2_krx[h2_krx$name == nm, ]
+  if (nm == "Nasdaq") x <- x[x$origination >= as.Date("1995-01-01"), ]
+  pk <- x$peak_date[which.max(x$days_above)]
+  d <- clean_h2[[nm]]; k <- which(d$date == pk); t <- seq_along(d$date) - k
+  keep <- t >= window[1] & t <= window[2]
+  data.frame(t = t[keep], y = d$log_price[keep] - d$log_price[k])
+})
+png("output/figures/h2_event_overlay_krx.png", width = 2000, height = 1200, res = 250)
+plot(NA, xlim = window, ylim = range(sapply(paths, function(z) range(z$y))),
+     xlab = "Trading days relative to price peak", ylab = "log price minus log peak price",
+     main = "Event-time overlay: Korea 2026 (KRX) vs Nasdaq 2000")
+abline(v = 0, h = 0, col = "grey", lty = 3)
+for (j in seq_along(paths)) lines(paths[[j]]$t, paths[[j]]$y, col = overlay_cols[j])
+legend("topleft", overlay_names, col = overlay_cols, lty = 1, bty = "n", cex = 0.8)
+dev.off()
+```
+
+# H3: GJR-GARCH(1,1)-t by regime (Appendix D)
+
+```{r h3}
+gjr_spec <- rugarch::ugarchspec(
+  variance.model     = list(model = "gjrGARCH", garchOrder = c(1, 1)),
+  mean.model         = list(armaOrder = c(0, 0), include.mean = TRUE),
+  distribution.model = "std")
+
+# Bubble regime: first kept episode (Nasdaq from 1995) to the end of the episode with the highest price
+bubble_window <- function(nm) {
+  x <- h2_krx[h2_krx$name == nm, ]
+  if (nm == "Nasdaq") x <- x[x$origination >= as.Date("1995-01-01"), ]
+  d <- clean_h2[[nm]]
+  pk_price <- d$log_price[match(x$peak_date, d$date)]
+  data.frame(start = min(x$origination), end = x$last_above[which.max(pk_price)])
+}
+
+fit_gjr <- function(nm, from, to, regime) {
+  d <- clean_h2[[nm]]
+  r <- 100 * d$log_ret[d$date >= from & d$date <= to]
+  r <- r[!is.na(r)]
+  out <- data.frame(name = nm, regime = regime, from = from, to = to, n = length(r),
+                    converged = FALSE, mu = NA, omega = NA, alpha1 = NA, beta1 = NA,
+                    gamma1 = NA, gamma_se = NA, gamma_p = NA, shape = NA,
+                    persistence = NA, lb_sq_p = NA)
+  fit <- tryCatch(rugarch::ugarchfit(gjr_spec, r, solver = "hybrid"), error = function(e) NULL)
+  if (is.null(fit) || rugarch::convergence(fit) != 0) return(out)
+  cf   <- coef(fit)
+  rob  <- fit@fit$robust.matcoef
+  pars <- c("mu", "omega", "alpha1", "beta1", "gamma1", "shape")
+  out$converged   <- TRUE
+  out[pars]       <- as.list(round(cf[pars], 4))
+  out$gamma_se    <- round(rob["gamma1", 2], 4)
+  out$gamma_p     <- round(rob["gamma1", 4], 3)
+  out$persistence <- round(cf["alpha1"] + cf["beta1"] + 0.5 * cf["gamma1"], 3)
+  z <- as.numeric(residuals(fit, standardize = TRUE))
+  out$lb_sq_p     <- round(Box.test(z^2, lag = 10, type = "Ljung-Box")$p.value, 3)
+  out
+}
+
+h3_map <- data.frame(
+  name        = c("KOSPI", "Samsung", "SK Hynix", "Nasdaq", "KRX Banks", "Dow Jones"),
+  window_from = c("KOSPI", "Samsung", "SK Hynix", "Nasdaq", "KOSPI",     "Nasdaq"),
+  role        = c("exposed", "exposed", "exposed", "exposed", "placebo", "placebo"))
+h3_map <- cbind(h3_map, do.call(rbind, lapply(h3_map$window_from, bubble_window)))
+readr::write_csv(h3_map, "output/tables/h3_regimes_krx.csv")
+
+set.seed(90011)
+h3_results <- do.call(rbind, lapply(seq_len(nrow(h3_map)), function(i) {
+  m <- h3_map[i, ]; d <- clean_h2[[m$name]]
+  rbind(fit_gjr(m$name, min(d$date), m$start - 1, "pre-bubble"),
+        fit_gjr(m$name, m$start, m$end, "bubble"),
+        if (m$window_from == "Nasdaq") fit_gjr(m$name, m$end + 1, max(d$date), "post-crash"))
+}))
+rownames(h3_results) <- NULL
+readr::write_csv(h3_results, "output/tables/stage2_gjr_by_regime_krx.csv")
+
+# One-sided z-test for a rise in gamma1, robust standard errors
+h3_compare <- do.call(rbind, lapply(unique(h3_results$name), function(nm) {
+  x <- h3_results[h3_results$name == nm, ]
+  pre <- x[x$regime == "pre-bubble", ]; bub <- x[x$regime == "bubble", ]
+  z <- (bub$gamma1 - pre$gamma1) / sqrt(bub$gamma_se^2 + pre$gamma_se^2)
+  data.frame(name = nm, role = h3_map$role[h3_map$name == nm],
+             gamma_pre = pre$gamma1, gamma_bubble = bub$gamma1,
+             diff = round(bub$gamma1 - pre$gamma1, 4), z = round(z, 2),
+             p_one_sided = round(1 - pnorm(z), 3), n_pre = pre$n, n_bubble = bub$n)
+}))
+readr::write_csv(h3_compare, "output/tables/stage2_h3_compare_krx.csv")
+h3_map
+h3_compare
+```
+
+# KOSPI and the two chip stocks (Section 1)
+
+```{r r-squared}
+r <- data.frame(KOSPI    = diff(log(krx$KOSPI$close)),
+                Samsung  = diff(log(krx$Samsung$close)),
+                SKHynix  = diff(log(krx$`SK Hynix`$close)),
+                KRXBanks = diff(log(krx$`KRX Banks`$close)))
+stopifnot(nrow(r) == 1411, all(krx$KOSPI$date == krx$Samsung$date),
+          all(krx$KOSPI$date == krx$`SK Hynix`$date), all(krx$KOSPI$date == krx$`KRX Banks`$date))
+
+round(sapply(c("Samsung", "SKHynix", "KRXBanks"), function(v) cor(r$KOSPI, r[[v]])), 3)
+
+rsq <- data.frame(
+  regression = c("KOSPI on Samsung and SK Hynix", "KRX Banks on Samsung and SK Hynix"),
+  r_squared  = round(c(summary(lm(KOSPI ~ Samsung + SKHynix, data = r))$r.squared,
+                       summary(lm(KRXBanks ~ Samsung + SKHynix, data = r))$r.squared), 3))
+rsq
+readr::write_csv(rsq, "output/tables/r_squared_chip_stocks.csv")
+```
+
+# Session information
+
+```{r session-info}
+sessionInfo()
+writeLines(capture.output(sessionInfo()), "output/session_info.txt")
+```
